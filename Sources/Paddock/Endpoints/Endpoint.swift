@@ -113,38 +113,92 @@ extension LogStreamCommon {
 		loglineIncludesTimestamps: Bool,
 		remainingBytes: inout ByteBuffer
 	) async throws(StreamChunkError) -> [DockerLogEntry] {
-		guard
-			buffer.readableBytes > 0
-		else { throw .noValidData }
+		guard buffer.readableBytes > 0 else { throw .noValidData }
 
 		var buffer = buffer
 
 		if isTTY {
 			var entries: [DockerLogEntry] = []
+
 			let data = Data(buffer: buffer)
-			let lines = data.split(separator: [0xd, 0xa]) // crlf
+			guard data.isEmpty == false else { throw .noValidData }
 
-			for line in lines {
-				let string = String(decoding: line, as: UTF8.self)
+			let newline: UInt8 = 0x0a // \n
+			let carriageReturn: UInt8 = 0x0d // \r
+
+			// Split by '\n'. Keep empty last element if the data ends with '\n'
+			let segments = data.split(separator: newline, omittingEmptySubsequences: false)
+			for (index, segment) in segments.enumerated() {
+				let isLast = index == segments.count - 1
+
+				// If last segment does not end with newline, it is incomplete: store in remaining
+				if isLast && data.last != newline {
+					remainingBytes.writeBytes(segment)
+					break
+				}
+
+				// Trim trailing '\r' from CRLF sequences
+				let trimmed = segment.last == carriageReturn ? segment.dropLast() : segment[...]
+				let string = String(decoding: trimmed, as: UTF8.self)
 				let (timestamp, logLine) = extractTimestamp(from: string, loglineIncludesTimestamps: loglineIncludesTimestamps)
-
 				entries.append(DockerLogEntry(source: .stdout, timestamp: timestamp, message: logLine))
 			}
+
+			guard entries.isEmpty == false else { throw .noValidData }
 			return entries
 		} else {
-			guard
-				let sourceRawValue: UInt8 = buffer.readInteger(),
-				let source = DockerLogEntry.Source(rawValue: sourceRawValue),
-				case _ = buffer.readBytes(length: 3),
-				let messageSize: UInt32 = buffer.readInteger(endianness: .big),
-				messageSize > 0,
-				let messageBytes = buffer.readBytes(length: Int(messageSize))
-			else { throw .noValidData }
+			// Non-TTY: Docker multiplexed raw stream frames
+			// Each frame: 1 byte stream, 3 bytes 0x00, 4 bytes big-endian length, N bytes payload
+			var entries: [DockerLogEntry] = []
 
-			let rawString = String(decoding: messageBytes, as: UTF8.self)
-			let (timestamp, logLine) = extractTimestamp(from: rawString, loglineIncludesTimestamps: loglineIncludesTimestamps)
+			while true {
+				let frameStartIndex = buffer.readerIndex
 
-			return [DockerLogEntry(source: source, timestamp: timestamp, message: logLine)]
+				// Need at least 8 bytes for the header
+				guard buffer.readableBytes >= 8 else { break }
+
+				guard let sourceRawValue: UInt8 = buffer.readInteger(),
+					  let source = DockerLogEntry.Source(rawValue: sourceRawValue) else {
+					// Invalid or incomplete; rewind and break to preserve bytes
+					buffer.moveReaderIndex(to: frameStartIndex)
+					break
+				}
+
+				// 3 reserved bytes
+				guard buffer.readableBytes >= 7 else {
+					buffer.moveReaderIndex(to: frameStartIndex)
+					break
+				}
+				_ = buffer.readBytes(length: 3)
+
+				guard let messageSize: UInt32 = buffer.readInteger(endianness: .big) else {
+					buffer.moveReaderIndex(to: frameStartIndex)
+					break
+				}
+
+				guard buffer.readableBytes >= Int(messageSize) else {
+					// Incomplete payload; rewind to start of frame and wait for more bytes
+					buffer.moveReaderIndex(to: frameStartIndex)
+					break
+				}
+
+				guard let messageBytes = buffer.readBytes(length: Int(messageSize)) else {
+					buffer.moveReaderIndex(to: frameStartIndex)
+					break
+				}
+
+				let rawString = String(decoding: messageBytes, as: UTF8.self)
+				let (timestamp, logLine) = extractTimestamp(from: rawString, loglineIncludesTimestamps: loglineIncludesTimestamps)
+				entries.append(DockerLogEntry(source: source, timestamp: timestamp, message: logLine))
+			}
+
+			// Preserve any unread bytes (partial frame) for the next chunk
+			if buffer.readableBytes > 0 {
+				remainingBytes.writeBuffer(&buffer)
+			}
+
+			guard entries.isEmpty == false else { throw .noValidData }
+			return entries
 		}
 	}
 
