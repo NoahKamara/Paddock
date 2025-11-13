@@ -54,7 +54,7 @@ public extension InspectImagesEndpoint {
 		/// What's different between this and `config`? Who knows.
 		/// Podman docs list both with identical info, and docker docs only list `config`.
 		/// In practice, Podman populates each one differently.
-		public let containerConfig: ContainerConfig
+		public let containerConfig: ContainerConfig?
 
 		/// Configuration for a container that is portable between hosts.
 		///
